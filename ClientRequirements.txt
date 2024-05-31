@@ -1,0 +1,20 @@
+Hi, possible to help with NLP task on WritingPrompt dataset(HuggingFace) when given a prompt, will generate a story. The model needed is Bi-LSTM Encoder, LSTM Decoder, and an attention mechanism & Transformer Encoder to make comparison on performance.
+
+The final product need to have a function to generate the predicted story given prompt, as well as to evaluate using BLEU and ROUGE
+
+The deliverables I need will be:
+1) Make existing LSTM model work well
+2) New Transformer encoder 
+3) Compare between LSTM and transformer model
+4) Validation Loss curve
+5) Generate sample text
+6) Evaluate using BLEU and ROUGE1&2
+
+But I need to see the training curve and text generation is working as well
+
+so given a prompt : its a dark, stormy night
+it will generate a story: xxx (100 length)
+
+but its variable length for both prompt and story
+
+I don't have but you can change the dataset if needed. But have to be seq to seq. so given a prompt, generate a story

@@ -1,0 +1,82 @@
+import torch.optim as optim
+import math
+import matplotlib.pyplot as plt
+
+# Setup the optimizer and loss function
+optimizer = optim.Adam(model.parameters())
+criterion = nn.CrossEntropyLoss(ignore_index=sp.piece_to_id('[PADDING]'))
+
+# Define hyperparameters
+n_epochs = 3
+clip = 1
+save_interval = 1  # Save every 2 epochs
+
+# Track the loss and performance
+train_losses = []
+valid_losses = []
+best_valid_loss = float('inf')
+
+# Inside the training loop
+for epoch in range(n_epochs):
+    model.train()  # Set the model to training mode
+    epoch_loss = 0
+
+    for src, trg in train_loader:
+        src = src.to(device)
+        trg = trg.to(device)
+
+        # Zero the gradients
+        optimizer.zero_grad()
+
+        # Forward pass
+        output = model(src, trg)  # output shape [batch size, trg len, output dim]
+
+        # Ignore the <sos> token in trg for loss calculation by starting from index 1
+        # trg and output dimensions must align; consider the final shape required for output and trg slicing
+        trg = trg[:, 1:].reshape(-1)  # Reshape trg to 1D
+        output = output[:, :-1, :].reshape(-1, output.shape[-1])  # Align output reshaping
+
+        # Create a mask for non-padding tokens to apply on trg
+        mask = (trg != sp.piece_to_id('[PADDING]'))
+
+        # Apply the mask to output and trg
+        output_masked = output[mask]
+        trg_masked = trg[mask]
+
+        # Calculate loss only on non-padding token positions
+        loss = criterion(output_masked, trg_masked)
+
+        # Backward pass
+        loss.backward()
+
+        # Clip gradients to prevent explosion
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+
+        # Update weights
+        optimizer.step()
+
+        epoch_loss += loss.item()
+
+    # Calculate average loss for the epoch
+    train_loss = epoch_loss / len(train_loader)
+    train_losses.append(train_loss)
+
+    # Perform validation
+    valid_loss = evaluate(model, valid_loader, criterion)
+    valid_losses.append(valid_loss)
+
+    # Conditional saving based on improvement
+    if valid_loss < best_valid_loss:
+        best_valid_loss = valid_loss
+        torch.save(model.state_dict(), 'model.pt')
+        print(f"Model saved: Improved validation loss to {valid_loss:.3f}")
+
+    # Periodic saving regardless of improvement
+    if epoch % save_interval == 0:
+        torch.save(model.state_dict(), f'model_epoch_{epoch}.pt')
+        print(f"Model checkpoint saved at epoch {epoch}")
+
+    # Print epoch results
+    print(f'Epoch: {epoch+1:02}')
+    print(f'\tTrain Loss: {train_loss:.3f} | Train PPL: {math.exp(train_loss):7.3f}')
+    print(f'\t Val. Loss: {valid_loss:.3f} |  Val. PPL: {math.exp(valid_loss):7.3f}')

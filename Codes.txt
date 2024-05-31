@@ -1,0 +1,529 @@
+import torch
+import numpy as np
+from datasets import load_dataset
+import sentencepiece as spm
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+import torch.optim as optim
+import torch.nn as nn
+import random
+from nltk.translate.bleu_score import corpus_bleu
+from rouge import Rouge
+
+import torch
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(device)
+
+Step 2a: Load and Prepare the Dataset
+# Ensure all necessary libraries are imported
+import torch
+from datasets import load_dataset
+
+# Setting the device for training
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Function to filter the dataset based on story length and duplication
+def filter_dataset(data):
+    story_length = len(data['story'].split())
+    is_length_valid = story_length <= 100  # Keeping story length <= 100
+    is_not_duplicate = data['prompt'] != data['story']  # Ensure prompt is not the same as story
+    return is_length_valid and is_not_duplicate
+
+# Load the WritingPrompts dataset from HuggingFace datasets
+dataset = load_dataset("euclaise/writingprompts")
+
+# Filter the dataset
+filtered_dataset = {split: dataset[split].filter(filter_dataset) for split in dataset.keys()}
+
+# Function to check the percentage of the dataset in each split after filtering
+def check_split_percentage(dataset):
+    total_entries = sum(dataset[split].num_rows for split in dataset.keys())
+    for split in dataset.keys():
+        split_percentage = (dataset[split].num_rows / total_entries) * 100
+        print(f"{split}: {split_percentage:.2f}% of the total dataset")
+
+# Execute the function to display dataset splits
+check_split_percentage(filtered_dataset)
+
+train: 91.04% of the total dataset
+test: 5.97% of the total dataset
+validation: 2.99% of the total dataset
+
+Step 2b: Check Dataset Size
+# Function to check the size of the dataset in each split after filtering
+def check_dataset_size(dataset):
+    total_entries = sum(dataset[split].num_rows for split in dataset.keys())
+    print(f"Total number of entries across all splits: {total_entries}")
+    for split in dataset.keys():
+        num_entries = dataset[split].num_rows
+        split_percentage = (num_entries / total_entries) * 100
+        print(f"{split} has {num_entries} entries, which is {split_percentage:.2f}% of the total dataset")
+
+# Execute the function to display dataset sizes
+check_dataset_size(filtered_dataset)
+
+Total number of entries across all splits: 201
+train has 183 entries, which is 91.04% of the total dataset
+test has 12 entries, which is 5.97% of the total dataset
+validation has 6 entries, which is 2.99% of the total dataset
+
+Step 3: Tokenization
+# Import necessary libraries for SentencePiece tokenization
+import sentencepiece as spm
+
+# Concatenate all prompts and stories to train the SentencePiece model
+def create_combined_text_file(dataset, file_path='writingprompts_combined.txt'):
+    with open(file_path, 'w', encoding='utf-8') as outfile:
+        for split in dataset.keys():
+            for data in dataset[split]:
+                combined_text = data['prompt'] + " " + data['story']
+                outfile.write(combined_text + '\n')
+
+# Call the function to create the combined text file
+create_combined_text_file(filtered_dataset)
+
+# Train SentencePiece model
+spm.SentencePieceTrainer.train(
+    input='writingprompts_combined.txt',
+    model_prefix='writingprompts_sentencepiece',
+    vocab_size=18833,  # Vocab size can be adjusted based on requirements
+    character_coverage=0.9995,
+    model_type='bpe'  # Byte pair encoding
+)
+
+# Load the trained SentencePiece model
+sp = spm.SentencePieceProcessor()
+sp.load('writingprompts_sentencepiece.model')
+
+# Define function to encode data using SentencePiece
+def encode_data(data):
+    data['input_ids'] = sp.encode_as_ids(data['prompt'] + " [EOS]")
+    data['labels'] = sp.encode_as_ids("[SOS] " + data['story'] + " [EOS]")
+    return data
+
+# Apply encoding to each split in the dataset
+encoded_dataset = {split: filtered_dataset[split].map(encode_data) for split in filtered_dataset.keys()}
+
+
+Step 4: Define the Sequence-to-Sequence Model with LSTM and Attention
+This code block defines an encoder with bidirectional LSTM, an attention mechanism, and a decoder that utilizes the computed attention weights. The Seq2Seq model orchestrates how data flows from the encoder to the decoder, using teacher forcing during training.
+
+
+# Define the encoder class
+class Encoder(nn.Module):
+    def __init__(self, input_dim, emb_dim, enc_hid_dim, dec_hid_dim, dropout):
+        super(Encoder, self).__init__()
+        self.embedding = nn.Embedding(input_dim, emb_dim)
+        self.rnn = nn.LSTM(emb_dim, enc_hid_dim, bidirectional=True, batch_first=True)
+        self.fc = nn.Linear(enc_hid_dim * 2, dec_hid_dim)  # Transform to decoder hidden size
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, src):
+        embedded = self.dropout(self.embedding(src))
+        outputs, (hidden, cell) = self.rnn(embedded)
+        hidden = torch.tanh(self.fc(torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim=1))).unsqueeze(0)
+        cell = torch.tanh(self.fc(torch.cat((cell[-2,:,:], cell[-1,:,:]), dim=1))).unsqueeze(0)
+
+        return outputs, hidden, cell
+
+# Define the attention class
+class Attention(nn.Module):
+    def __init__(self, enc_hid_dim, dec_hid_dim):
+        super(Attention, self).__init__()
+        self.attn = nn.Linear((enc_hid_dim * 2) + dec_hid_dim, dec_hid_dim)
+        self.v = nn.Linear(dec_hid_dim, 1, bias=False)
+
+    def forward(self, hidden, encoder_outputs):
+        print("Shapes before concatenation:")
+        print("Hidden:", hidden.shape)
+        print("Encoder outputs:", encoder_outputs.shape)
+
+        # Repeat the hidden state to match the batch size of encoder_outputs
+        hidden = hidden.permute(1, 0, 2)
+        hidden = hidden.repeat(1, encoder_outputs.shape[1], 1)
+
+        # Concatenate along the last dimension (features dimension)
+        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))
+        print("Shape after concatenation:", energy.shape)
+
+        # Compute the attention weights
+        attention = self.v(energy).squeeze(2)
+        return torch.softmax(attention, dim=1)
+
+
+
+# Define the decoder class
+class Decoder(nn.Module):
+    def __init__(self, output_dim, emb_dim, enc_hid_dim, dec_hid_dim, dropout, attention):
+        super(Decoder, self).__init__()
+        self.output_dim = output_dim
+        self.attention = attention
+        self.embedding = nn.Embedding(output_dim, emb_dim)
+        # Ensure emb_dim aligns with the weighted tensor's feature size
+        self.align_features = nn.Linear(emb_dim, enc_hid_dim * 2)  # Adjust emb_dim to match enc_hid_dim * 2
+        self.rnn = nn.LSTM((enc_hid_dim * 2) + (enc_hid_dim * 2), dec_hid_dim, batch_first=True)
+        self.fc_out = nn.Linear(dec_hid_dim, output_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, input, hidden, cell, encoder_outputs):
+        input = input.unsqueeze(1)  # Ensure input is [batch size, 1]
+        embedded = self.embedding(input)
+        embedded = self.dropout(embedded)
+
+        # Flatten the embedded tensor to [batch size, 1, emb_dim] and align dimensions
+        embedded = embedded.view(embedded.size(0), 1, -1)
+        embedded = self.align_features(embedded)  # Adjust embedding dimension to match weighted
+
+        # Print dimensions for debugging
+        print("Post alignment Embedded size:", embedded.shape)
+
+        # Attention processing
+        a = self.attention(hidden, encoder_outputs)  # Compute attention weights
+        a = a.unsqueeze(1)  # Adjust shape for batch matrix multiplication
+        weighted = torch.bmm(a, encoder_outputs)  # Apply attention weights
+
+        # Print dimensions for debugging
+        print("Weighted size:", weighted.shape)
+        
+        # Check dimensions before concatenation
+        if embedded.shape != weighted.shape:
+            raise ValueError(f"Dimension mismatch: embedded {embedded.shape}, weighted {weighted.shape}")
+
+        rnn_input = torch.cat((embedded, weighted), dim=2)  # Concatenate along the feature dimension
+        output, (hidden, cell) = self.rnn(rnn_input, (hidden, cell))
+        prediction = self.fc_out(output.squeeze(1))
+
+        return prediction, hidden, cell
+
+
+# Define the Seq2Seq model
+class Seq2Seq(nn.Module):
+    def __init__(self, encoder, decoder, device):
+        super(Seq2Seq, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.device = device
+
+    def forward(self, src, trg, teacher_forcing_ratio=0.5):
+        trg_len = trg.shape[1]
+        batch_size = trg.shape[0]  # Add this line to get the batch size
+        trg_vocab_size = self.decoder.output_dim
+        outputs = torch.zeros(batch_size, trg_len, trg_vocab_size).to(self.device)  # Correct initialization
+        encoder_outputs, hidden, cell = self.encoder(src)
+
+        # First input to the decoder is the <sos> tokens
+        input = trg[:, 0]
+        for t in range(1, trg_len):
+            output, hidden, cell = self.decoder(input, hidden, cell, encoder_outputs)
+            outputs[:, t] = output  # Ensure output tensor has the correct shape
+            teacher_force = random.random() < teacher_forcing_ratio
+            input = trg[:, t] if teacher_force else output.argmax(1)
+
+        return outputs
+
+
+# Parameters and instantiation
+INPUT_DIM = len(sp)
+OUTPUT_DIM = len(sp)
+ENC_EMB_DIM = 256
+DEC_EMB_DIM = 256
+ENC_HID_DIM = 512
+DEC_HID_DIM = 512
+ENC_DROPOUT = 0.5
+DEC_DROPOUT = 0.5
+
+# Instantiate the Bi-LSTM model
+bi_lstm_encoder = Encoder(INPUT_DIM, ENC_EMB_DIM, ENC_HID_DIM, DEC_HID_DIM, ENC_DROPOUT)
+attention = Attention(ENC_HID_DIM, DEC_HID_DIM)
+bi_lstm_decoder = Decoder(OUTPUT_DIM, DEC_EMB_DIM, ENC_HID_DIM, DEC_HID_DIM, DEC_DROPOUT, attention)
+bilstm_model = Seq2Seq(bi_lstm_encoder, bi_lstm_decoder, device).to(device)
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import math
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+from datasets import load_dataset
+import sentencepiece as spm
+import random
+from nltk.translate.bleu_score import sentence_bleu
+from rouge import Rouge
+from tqdm import tqdm
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+import torch
+import torch.nn as nn
+import math
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, emb_dim, dropout, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        pe = torch.zeros(max_len, emb_dim)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, emb_dim, 2).float() * (-math.log(10000.0) / emb_dim))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:x.size(0), :]
+        return self.dropout(x)
+
+class TransformerEncoderLayer(nn.Module):
+    def __init__(self, emb_dim, n_heads, hidden_dim, dropout):
+        super(TransformerEncoderLayer, self).__init__()
+        self.self_attention = nn.MultiheadAttention(emb_dim, n_heads, dropout=dropout)
+        self.linear1 = nn.Linear(emb_dim, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, emb_dim)
+        self.norm1 = nn.LayerNorm(emb_dim)
+        self.norm2 = nn.LayerNorm(emb_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, src):
+        src2, _ = self.self_attention(src, src, src)
+        src = src + self.dropout(src2)
+        src = self.norm1(src)
+        src2 = self.linear2(self.dropout(torch.relu(self.linear1(src))))
+        src = src + self.dropout(src2)
+        src = self.norm2(src)
+        return src
+
+class TransformerEncoder(nn.Module):
+    def __init__(self, input_dim, emb_dim, n_heads, hidden_dim, n_layers, dropout):
+        super(TransformerEncoder, self).__init__()
+        self.embedding = nn.Embedding(input_dim, emb_dim)
+        self.positional_encoding = PositionalEncoding(emb_dim, dropout)
+        self.layers = nn.ModuleList([
+            TransformerEncoderLayer(emb_dim, n_heads, hidden_dim, dropout)
+            for _ in range(n_layers)
+        ])
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, src):
+        embedded = self.embedding(src) * math.sqrt(self.embedding.embedding_dim)
+        embedded = self.positional_encoding(embedded)
+        x = self.dropout(embedded)
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+class Seq2Seq(nn.Module):
+    def __init__(self, encoder, device, decoder=None):
+        super(Seq2Seq, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.device = device
+
+    def forward(self, src, trg=None, teacher_forcing_ratio=0.5):
+        if self.decoder is not None:
+            # Case for models with decoder (like Bi-LSTM)
+            batch_size = trg.shape[0]
+            trg_len = trg.shape[1]
+            trg_vocab_size = self.decoder.output_dim
+            outputs = torch.zeros(batch_size, trg_len, trg_vocab_size).to(self.device)
+            encoder_output = self.encoder(src)
+
+            input = trg[:, 0]  # <sos> token
+            for t in range(1, trg_len):
+                output, _, _ = self.decoder(input, encoder_output)
+                outputs[:, t] = output
+                teacher_force = random.random() < teacher_forcing_ratio
+                top1 = output.argmax(1)
+                input = trg[:, t] if teacher_force else top1
+            return outputs
+        else:
+            # Case for models without decoder (like Transformer)
+            return self.encoder(src)
+
+# Instantiate the Transformer encoder
+N_HEADS = 8  # Define the number of attention heads
+N_LAYERS = 6  # Define the number of transformer layers
+HIDDEN_DIM = 2048  # Define the hidden dimension size
+transformer_encoder = TransformerEncoder(INPUT_DIM, ENC_EMB_DIM, N_HEADS, HIDDEN_DIM, N_LAYERS, ENC_DROPOUT)
+transformer_model = Seq2Seq(transformer_encoder, device).to(device)
+
+Step 5: Training Setup
+This cell prepares data loaders that will be used to feed data into the model during training and evaluation. The collate_fn function handles padding of sequences to ensure they are of uniform length within a batch.
+
+# Function to collate data samples into batches
+def collate_fn(batch):
+    inputs = [item['input_ids'] for item in batch]
+    targets = [item['labels'] for item in batch]
+
+    inputs_padded = pad_sequence([torch.tensor(seq) for seq in inputs], 
+                                 padding_value=sp.piece_to_id('[PADDING]'), 
+                                 batch_first=True)
+    targets_padded = pad_sequence([torch.tensor(seq) for seq in targets], 
+                                  padding_value=sp.piece_to_id('[PADDING]'), 
+                                  batch_first=True)
+
+    return inputs_padded, targets_padded
+
+# DataLoader for each dataset split
+batch_size = 32
+train_loader = DataLoader(encoded_dataset['train'], batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+valid_loader = DataLoader(encoded_dataset['validation'], batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+test_loader = DataLoader(encoded_dataset['test'], batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+
+Step 6: Define the Training Function
+This code sets up functions for training and evaluating the model. train is used during the training phase to adjust the model weights, while evaluate is used to assess the model's performance on validation and test sets without making any adjustments to the weights.
+
+# Define training function for both Bi-LSTM and Transformer models
+def train(model, iterator, optimizer, criterion, clip):
+    model.train()
+    epoch_loss = 0
+
+    for src, trg in iterator:
+        src, trg = src.to(device), trg.to(device)
+        optimizer.zero_grad()
+        output = model(src, trg)
+
+        # Flatten output for cross-entropy loss calculation
+        output_dim = output.shape[-1]
+        output_flattened = output.contiguous().view(-1, output_dim)
+        trg_flattened = trg[:, 1:].contiguous().view(-1)
+
+        # Ensure that output and trg have the same total length
+        if output_flattened.shape[0] != trg_flattened.shape[0]:
+            raise ValueError(f"Mismatch in flattened shapes: output {output_flattened.shape[0]}, target {trg_flattened.shape[0]}")
+
+        # Calculate loss only on non-padding token positions
+        non_pad_mask = trg_flattened != sp.piece_to_id('[PADDING]')
+        output_masked = output_flattened[non_pad_mask]
+        trg_masked = trg_flattened[non_pad_mask]
+
+        loss = criterion(output_masked, trg_masked)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+        optimizer.step()
+        epoch_loss += loss.item()
+
+    return epoch_loss / len(iterator)
+
+
+
+# Define evaluation function for both Bi-LSTM and Transformer models
+def evaluate(model, iterator, criterion):
+    model.eval()
+    epoch_loss = 0
+    with torch.no_grad():
+        for src, trg in iterator:
+            src, trg = src.to(device), trg.to(device)
+
+            # Assume the model expects both src and trg for shape compatibility but does not use trg to generate output
+            output = model(src, trg[:, :-1])  # Feed the target excluding the last element
+
+            # Flatten the output and target for loss calculation
+            output_flat = output.reshape(-1, output.shape[-1])
+            trg_flat = trg[:, 1:].reshape(-1)  # Skip <sos> token and flatten
+
+            # Apply mask to ignore the padding in loss calculation
+            non_pad_mask = trg_flat != sp.piece_to_id('[PADDING]')
+            output_masked = output_flat[non_pad_mask]
+            trg_masked = trg_flat[non_pad_mask]
+
+            loss = criterion(output_masked, trg_masked)
+            epoch_loss += loss.item()
+
+    return epoch_loss / len(iterator)
+
+
+Step 7: Training the Model
+Initializes the optimizer and loss criterion.
+Defines the number of training epochs and a gradient clipping threshold to prevent exploding gradients.
+Iterates over the set number of epochs, performing training and validation.
+Saves the model checkpoint if the validation loss improves.
+
+
+import os
+import torch
+import torch.optim as optim
+import torch.nn as nn
+import math
+
+# Environment setting for detailed CUDA error messages
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+
+# Assuming 'transformer_model' and 'sp' (SentencePiece tokenizer) are already defined
+num_classes = len(sp)  # This should be set based on your tokenizer's vocabulary size
+
+# Configure the output layer of the Transformer model's decoder to match the number of token classes
+# Assume 'dec_hid_dim' is defined as the dimensionality of the decoder's hidden states
+if hasattr(transformer_model, 'decoder') and hasattr(transformer_model.decoder, 'output_layer'):
+    transformer_model.decoder.output_layer = nn.Linear(dec_hid_dim, num_classes)
+else:
+    print("Check model architecture - decoder/output layer configuration differs")
+
+# Setup for the Transformer model
+optimizer_transformer = optim.Adam(transformer_model.parameters())
+criterion_transformer = nn.CrossEntropyLoss(ignore_index=sp.piece_to_id('[PADDING]'))
+
+# Number of epochs and gradient clipping threshold
+n_epochs = 1
+clip = 1
+
+# Training and validation loss tracking
+train_losses_transformer = []
+valid_losses_transformer = []
+best_valid_loss_transformer = float('inf')
+
+# Training loop for the Transformer model
+for epoch in range(n_epochs):
+    transformer_model.train()  # Set the model to training mode
+    epoch_loss_transformer = 0
+
+    for src, trg in train_loader:
+        src, trg = src.to(device), trg.to(device)
+
+        # Zero the gradients
+        optimizer_transformer.zero_grad()
+
+        # Forward pass through the Transformer model
+        output = transformer_model(src)
+
+        # Check and print output dimensions
+        print("Output shape before reshaping:", output.shape)
+        num_features = output.shape[-1]
+        if num_features != num_classes:
+            raise ValueError(f"Model's output features {num_features} do not match num_classes {num_classes}")
+
+        # Flatten the output for loss calculation
+        output_flat = output.contiguous().view(-1, num_features)
+        trg_flat = trg[:, 1:].contiguous().view(-1)
+
+        # Mask out padding from the target to ensure it aligns with output
+        mask = (trg_flat != sp.piece_to_id('[PADDING]'))
+        output_masked = output_flat[mask]
+        trg_masked = trg_flat[mask]
+
+        # Calculate the loss using only the masked (non-padded) portions of output and target
+        loss = criterion_transformer(output_masked, trg_masked)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(transformer_model.parameters(), clip)
+        optimizer_transformer.step()
+
+        epoch_loss_transformer += loss.item()
+
+    # Calculate and store average loss
+    train_loss_transformer = epoch_loss_transformer / len(train_loader)
+    train_losses_transformer.append(train_loss_transformer)
+
+    # Validation
+    valid_loss_transformer = evaluate(transformer_model, valid_loader, criterion_transformer)
+    valid_losses_transformer.append(valid_loss_transformer)
+
+    # Save model if validation improves
+    if valid_loss_transformer < best_valid_loss_transformer:
+        best_valid_loss_transformer = valid_loss_transformer
+        torch.save(transformer_model.state_dict(), 'transformer_model.pt')
+        print(f"Transformer Model saved: Improved validation loss to {valid_loss_transformer:.3f}")
+
+    # Print epoch results
+    print(f'Epoch: {epoch + 1:02}')
+    print(f'\tTrain Loss: {train_loss_transformer:.3f} | Train PPL: {math.exp(train_loss_transformer):7.3f}')
+    print(f'\tVal. Loss: {valid_loss_transformer:.3f} | Val. PPL: {math.exp(valid_loss_transformer):7.3f}')

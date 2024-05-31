@@ -1,0 +1,127 @@
+# Define the encoder class
+class Encoder(nn.Module):
+    def __init__(self, input_dim, emb_dim, enc_hid_dim, dec_hid_dim, dropout):
+        super(Encoder, self).__init__()
+        self.embedding = nn.Embedding(input_dim, emb_dim)
+        self.rnn = nn.LSTM(emb_dim, enc_hid_dim, bidirectional=True, batch_first=True)
+        self.fc = nn.Linear(enc_hid_dim * 2, dec_hid_dim)  # Transform to decoder hidden size
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, src):
+        embedded = self.dropout(self.embedding(src))
+        outputs, (hidden, cell) = self.rnn(embedded)
+
+        # hidden and cell are [2, batch, enc_hid_dim] since LSTM is bidirectional
+        # We need to convert these to [1, batch, dec_hid_dim] for the decoder
+        hidden = torch.tanh(self.fc(torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim=1))).unsqueeze(0)
+        cell = torch.tanh(self.fc(torch.cat((cell[-2,:,:], cell[-1,:,:]), dim=1))).unsqueeze(0)
+
+        return outputs, hidden, cell
+
+# Define the attention class
+class Attention(nn.Module):
+    def __init__(self, enc_hid_dim, dec_hid_dim):
+        super(Attention, self).__init__()
+        self.attn = nn.Linear((enc_hid_dim * 2) + dec_hid_dim, dec_hid_dim)
+        self.v = nn.Linear(dec_hid_dim, 1, bias=False)
+
+    def forward(self, hidden, encoder_outputs):
+        print("Shapes before concatenation:")
+        print("Hidden:", hidden.shape)
+        print("Encoder outputs:", encoder_outputs.shape)
+
+        # Repeat the hidden state to match the batch size of encoder_outputs
+        hidden = hidden.permute(1, 0, 2)
+        hidden = hidden.repeat(1, encoder_outputs.shape[1], 1)
+
+        # Concatenate along the last dimension (features dimension)
+        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))
+        print("Shape after concatenation:", energy.shape)
+
+        # Compute the attention weights
+        attention = self.v(energy).squeeze(2)
+        return torch.softmax(attention, dim=1)
+
+
+
+# Define the decoder class
+class Decoder(nn.Module):
+    def __init__(self, output_dim, emb_dim, enc_hid_dim, dec_hid_dim, dropout, attention):
+        super(Decoder, self).__init__()
+        self.output_dim = output_dim
+        self.attention = attention
+        self.embedding = nn.Embedding(output_dim, emb_dim)
+        self.rnn = nn.LSTM((enc_hid_dim * 2) + emb_dim, dec_hid_dim, batch_first=True)
+        self.fc_out = nn.Linear(dec_hid_dim, output_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, input, hidden, cell, encoder_outputs):
+        input = input.unsqueeze(1)  # Ensure input is [batch size, 1]
+        embedded = self.dropout(self.embedding(input))
+
+        # Attention over the encoder's output
+        a = self.attention(hidden, encoder_outputs)  # [batch size, src len]
+        a = a.unsqueeze(1)  # [batch size, 1, src len]
+        weighted = torch.bmm(a, encoder_outputs)  # [batch size, 1, enc_hid_dim * 2]
+
+        # Debug prints to check tensor shapes
+        print("Shapes before concatenation:")
+        print("Embedded:", embedded.shape)
+        print("Weighted:", weighted.shape)
+
+        # Concatenate embedded and weighted tensors
+        rnn_input = torch.cat((embedded, weighted), dim=2)
+
+        # Debug print to check the shape of rnn_input
+        print("Shape after concatenation:", rnn_input.shape)
+
+        output, (hidden, cell) = self.rnn(rnn_input, (hidden, cell))
+        prediction = self.fc_out(output.squeeze(1))
+        return prediction, hidden, cell
+
+
+
+
+
+# Define the Seq2Seq model
+class Seq2Seq(nn.Module):
+    def __init__(self, encoder, decoder, device):
+        super(Seq2Seq, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.device = device
+
+    def forward(self, src, trg, teacher_forcing_ratio=0.5):
+        trg_len = trg.shape[1]
+        batch_size = trg.shape[0]  # Add this line to get the batch size
+        trg_vocab_size = self.decoder.output_dim
+        outputs = torch.zeros(trg_len, batch_size, trg_vocab_size).to(self.device)  # Correct initialization
+        encoder_outputs, hidden, cell = self.encoder(src)
+
+        # First input to the decoder is the <sos> tokens
+        input = trg[:, 0]
+        for t in range(1, trg_len):
+            output, hidden, cell = self.decoder(input, hidden, cell, encoder_outputs)
+            outputs[t] = output  # Ensure output tensor has the correct shape
+            teacher_force = random.random() < teacher_forcing_ratio
+            top1 = output.argmax(1)
+            input = trg[:, t] if teacher_force else top1
+
+        return outputs
+
+
+# Parameters and instantiation
+INPUT_DIM = len(sp)
+OUTPUT_DIM = len(sp)
+ENC_EMB_DIM = 256
+DEC_EMB_DIM = 256
+ENC_HID_DIM = 512
+DEC_HID_DIM = 512
+ENC_DROPOUT = 0.5
+DEC_DROPOUT = 0.5
+
+attn = Attention(ENC_HID_DIM, DEC_HID_DIM)
+enc = Encoder(INPUT_DIM, ENC_EMB_DIM, ENC_HID_DIM, DEC_HID_DIM, ENC_DROPOUT)
+dec = Decoder(OUTPUT_DIM, DEC_EMB_DIM, ENC_HID_DIM, DEC_HID_DIM, DEC_DROPOUT, attn)
+
+model = Seq2Seq(enc, dec, device).to(device)
